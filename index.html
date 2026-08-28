@@ -2118,7 +2118,7 @@ function applyWeek(idx) {
 }
 
 function resetWeekState() {
-  // Clear per-WEEK data only (contacts are AP-level, loaded separately)
+  // Clear ALL per-week fields to zero — prevents any bleed when switching AP or week
   state.walkthroughs        = 0;
   state.feedbackCount       = 0;
   state.debriefCount        = 0;
@@ -2127,7 +2127,7 @@ function resetWeekState() {
   state.assessments         = [];
   state.weeklyHistory       = [];
   state.cycleSelectedWeeks  = [];
-  // Note: state.contacts is NOT reset here — it's AP-level and reloaded via loadAPContacts()
+  // contacts are AP-level — reset separately in loadState before reloading
 }
 
 // ══ STORAGE KEY ══
@@ -2164,61 +2164,88 @@ function saveState() {
 
 // ══ LOAD ══
 async function loadState() {
-  // Step 1: Load week-specific data from localStorage
+  // ── STEP 1: Always start clean for this AP+week ──
+  // This prevents any bleed from previous AP or week
+  resetWeekState();
+  state.contacts = [];   // contacts also start clean — reloaded below
+
+  // ── STEP 2: Load from localStorage (instant, offline-first) ──
   const raw = localStorage.getItem(localKey());
   if(raw) {
     try {
       const s = JSON.parse(raw);
-      // Load week-specific fields (NOT contacts — those are AP-level)
       ['walkthroughs','feedbackCount','debriefCount','wtLog',
        'studentData','assessments','weeklyHistory','cycleSelectedWeeks'].forEach(k => {
         if(s[k] !== undefined) state[k] = s[k];
       });
-    } catch(e) { console.error('Parse error loading localStorage', e); }
+    } catch(e) { console.error('localStorage parse error', e); }
   }
-  // Step 1b: Load ALL contacts for this AP (across all weeks) for cycle filtering
+  // Load this AP's contacts from local cache
   loadAPContacts();
   syncInputs();
-  updateAll();  // Render immediately from localStorage so UI is never blank
+  updateAll();  // Render immediately so UI is never blank
 
-  // Step 2: If Sheets connected, fetch FULL data (overrides local if Sheets is newer)
+  // ── STEP 3: If Sheets connected, fetch latest and re-render ──
   const url = getEffectiveURL();
-  if(url) {
-    setLoadStatus('loading');
-    try {
-      // Load week-specific data (walkthroughs, student data, assessments, wtLog)
-      const resp   = await fetch(`${url}?action=load&ap=${state.ap}&week=${state.week}`);
-      const result = await resp.json();
-      if(result.found) {
-        // Merge full log arrays from Sheets — this is how cross-AP viewing works
-        if(result.wtLog        && result.wtLog.length)        state.wtLog        = result.wtLog;
-        if(result.assessments  && result.assessments.length)  state.assessments  = result.assessments;
-        if(result.walkthroughs  != null) state.walkthroughs  = result.walkthroughs;
-        if(result.feedbackCount != null) state.feedbackCount = result.feedbackCount;
-        if(result.debriefCount  != null) state.debriefCount  = result.debriefCount;
-        if(result.studentData)           state.studentData   = { ...state.studentData, ...result.studentData };
-        // Save merged data back to local for offline use
-        localStorage.setItem(localKey(), JSON.stringify(state));
-        syncInputs();
-        setLoadStatus('synced');
-      } else {
-        setLoadStatus('new');
+  if(!url) return;
+
+  setLoadStatus('loading');
+  try {
+    // 3a: Load week-specific data for THIS AP + THIS WEEK only
+    const resp   = await fetch(`${url}?action=load&ap=${state.ap}&week=${state.week}`);
+    const result = await resp.json();
+
+    if(result.found) {
+      // Sheets is source of truth — overwrite local with Sheets data
+      // wtLog: use Sheets version if it has entries; otherwise keep local
+      if(result.wtLog && result.wtLog.length > 0) {
+        state.wtLog = result.wtLog;
+        // Recalculate counts from actual log entries (not stored counts)
+        // This prevents count/log mismatch
+        state.walkthroughs  = Math.min(8, state.wtLog.length);
+        state.feedbackCount = state.wtLog.filter(w =>
+          w.feedback && (w.feedback === 'yes-written' || w.feedback === 'yes-verbal')).length;
+        state.debriefCount  = state.wtLog.filter(w => w.debrief === 'yes').length;
+      } else if(result.walkthroughs != null) {
+        // No log entries in Sheets — use summary counts but clear log
+        // (old data from before full log storage was added)
+        state.walkthroughs  = result.walkthroughs;
+        state.feedbackCount = result.feedbackCount || 0;
+        state.debriefCount  = result.debriefCount  || 0;
+        state.wtLog = [];
       }
 
-      // Load AP-level contacts (all weeks) from Sheets
-      const cResp   = await fetch(`${url}?action=loadContacts&ap=${state.ap}`);
-      const cResult = await cResp.json();
-      if(cResult.found && cResult.contacts.length) {
-        state.contacts = cResult.contacts;
-        saveAPContacts(); // cache locally
+      if(result.assessments && result.assessments.length > 0) {
+        state.assessments = result.assessments;
+      }
+      if(result.studentData) {
+        state.studentData = { ...state.studentData, ...result.studentData };
       }
 
-      updateAll();
-    } catch(err) {
-      console.error('Sheets load error:', err);
-      setLoadStatus('offline');
-      updateAll();
+      // Cache merged data locally
+      localStorage.setItem(localKey(), JSON.stringify(state));
+      syncInputs();
+      setLoadStatus('synced');
+    } else {
+      setLoadStatus('new');
     }
+
+    // 3b: Load contacts for THIS AP ONLY from Sheets
+    const cResp   = await fetch(`${url}?action=loadContacts&ap=${state.ap}`);
+    const cResult = await cResp.json();
+    if(cResult.found && Array.isArray(cResult.contacts) && cResult.contacts.length) {
+      // Only accept contacts that actually belong to this AP
+      state.contacts = cResult.contacts.filter(c =>
+        !c.ap || c.ap === state.ap  // accept if no AP tag, or if AP matches
+      );
+      saveAPContacts();
+    }
+
+    updateAll();  // Final render with Sheets data
+  } catch(err) {
+    console.error('Sheets load error:', err);
+    setLoadStatus('offline');
+    // Already rendered from local in Step 2 — no need to updateAll again
   }
 }
 
@@ -2375,8 +2402,10 @@ function logWT() {
   };
   if(!state.wtLog) state.wtLog = [];
   state.wtLog.unshift(entry);
+  // Always recalculate from actual log entries — never let counts drift from reality
   state.walkthroughs  = Math.min(8, state.wtLog.length);
-  state.feedbackCount = state.wtLog.filter(w => w.feedback && w.feedback.startsWith('yes')).length;
+  state.feedbackCount = state.wtLog.filter(w =>
+    w.feedback && (w.feedback === 'yes-written' || w.feedback === 'yes-verbal')).length;
   state.debriefCount  = state.wtLog.filter(w => w.debrief === 'yes').length;
   const fbCount  = document.getElementById('fbCount');
   const dbCount  = document.getElementById('debriefCount');
@@ -2419,13 +2448,19 @@ function renderWTLog() {
       <td class="${w.feedback&&w.feedback.startsWith('yes')?'feedback-yes':'feedback-no'}">${feedbackLabel(w.feedback)}</td>
       <td class="${w.debrief==='yes'?'feedback-yes':'feedback-no'}">${debriefLabel(w.debrief)}</td>
     </tr>`).join('');
-  // Also refresh sidebar counts
+  // Recalculate and display counts from actual log entries
   const fbCount = document.getElementById('fbCount');
   const dbCount = document.getElementById('debriefCount');
   const pendFB  = document.getElementById('pendingFB');
-  if(fbCount) fbCount.textContent = log.filter(w => w.feedback && w.feedback.startsWith('yes')).length;
-  if(dbCount) dbCount.textContent = log.filter(w => w.debrief === 'yes').length;
-  if(pendFB)  pendFB.textContent  = log.filter(w => !w.feedback || w.feedback === 'pending' || w.feedback === 'no').length;
+  const fbDone = log.filter(w => w.feedback === 'yes-written' || w.feedback === 'yes-verbal').length;
+  const dbDone = log.filter(w => w.debrief === 'yes').length;
+  const fbPend = log.filter(w => !w.feedback || w.feedback === 'pending' || w.feedback === 'no').length;
+  if(fbCount) fbCount.textContent = fbDone;
+  if(dbCount) dbCount.textContent = dbDone;
+  if(pendFB)  pendFB.textContent  = fbPend;
+  // Keep state in sync with displayed counts
+  state.feedbackCount = fbDone;
+  state.debriefCount  = dbDone;
 }
 function feedbackLabel(v) {
   return {'yes-written':'✓ Written','yes-verbal':'✓ Verbal','pending':'⏳ Pending','no':'✗ None','':'—'}[v||''] || v || '—';
@@ -2597,7 +2632,8 @@ function logContact() {
     reason:     document.getElementById('c-reason').value,
     notes:      document.getElementById('c-notes').value,
     followup:   document.getElementById('c-followup').value,
-    schoolWeek: state.week,    // tag with current school week number for cycle filtering
+    schoolWeek: state.week,  // tag with school week for cycle filtering
+    ap:         state.ap,    // tag with AP so contacts never bleed across grades
     id: Date.now()
   };
   state.contacts.unshift(entry);
